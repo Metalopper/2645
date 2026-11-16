@@ -1,0 +1,91 @@
+name: Video Transcoder Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      work_id:
+        description: "Work ID"
+        required: true
+      source_url:
+        description: "URL to download raw video from VPS"
+        required: true
+      callback_url:
+        description: "VPS callback base URL"
+        required: true
+
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Report Runner Spun Up
+        run: |
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
+            -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
+
+      - name: Bootstrap Static FFmpeg & Tools
+        run: |
+          mkdir -p bin work
+          echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 jq
+          curl -sL https://github.com/eugeneware/ffmpeg-static/releases/latest/download/linux-x64 -o bin/ffmpeg
+          curl -sL https://github.com/eugeneware/ffprobe-static/releases/latest/download/linux-x64 -o bin/ffprobe
+          chmod +x bin/ffmpeg bin/ffprobe
+
+      - name: Download Raw Video
+        run: |
+          cd work
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
+            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING"
+            
+          aria2c -x 4 -s 4 --retry-wait=2 --max-tries=3 -o "source_video" "${{ inputs.source_url }}" || \
+          curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
+
+      - name: Transcode Media & Extract Thumbnail
+        run: |
+          cd work
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
+            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING"
+
+          # 1. Transcode video with faststart streaming flag
+          ffmpeg -y -v warning -stats \
+            -i source_video \
+            -c:v libx264 -preset veryfast -crf 22 \
+            -pix_fmt yuv420p -movflags +faststart \
+            -c:a aac -b:a 128k -threads 0 \
+            "video.mp4"
+            
+          # 2. Extract poster thumbnail at 5s (or 0s fallback)
+          ffmpeg -ss 00:00:05 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg" || \
+          ffmpeg -ss 00:00:00 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg"
+
+          # 3. Extract technical metadata
+          ffprobe -v quiet -print_format json -show_format -show_streams video.mp4 > "technical_metadata.json"
+
+      - name: Upload Finished Bundle to VPS
+        run: |
+          cd work
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
+            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK"
+
+          curl -f -X POST \
+            --retry 5 \
+            --retry-delay 3 \
+            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
+            -F "work_id=${{ inputs.work_id }}" \
+            -F "video=@video.mp4" \
+            -F "thumbnail=@thumbnail.jpg" \
+            -F "technical_metadata=@technical_metadata.json" \
+            "${{ inputs.callback_url }}/complete"
+
+      - name: Handle Failure
+        if: failure()
+        run: |
+          curl -X POST "${{ inputs.callback_url }}/fail" \
+            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
+            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner"
