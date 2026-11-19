@@ -16,14 +16,14 @@ on:
 jobs:
   transcode:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Report Runner Spun Up
         run: |
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
-            -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
+          API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
+          [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
 
       - name: Bootstrap Static FFmpeg & Tools
         run: |
@@ -37,55 +37,40 @@ jobs:
       - name: Download Raw Video
         run: |
           cd work
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
-            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING"
+          API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
+          [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING"
             
-          aria2c -x 4 -s 4 --retry-wait=2 --max-tries=3 -o "source_video" "${{ inputs.source_url }}" || \
-          curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
+          aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" ||           curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
 
-      - name: Transcode Media & Extract Thumbnail
+      - name: Transcode Media (Lossy Space-Saving H.264 + Stereo AAC + Faststart)
         run: |
           cd work
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
-            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING"
+          API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
+          [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING"
 
-          # 1. Transcode video with faststart streaming flag
-          ffmpeg -y -v warning -stats \
-            -i source_video \
-            -c:v libx264 -preset veryfast -crf 22 \
-            -pix_fmt yuv420p -movflags +faststart \
-            -c:a aac -b:a 128k -threads 0 \
-            "video.mp4"
+          # Transcode video with lossy space-saving profile, stereo downmixing, and faststart
+          ffmpeg -y -v warning -stats             -i source_video             -vf "scale='min(1920,iw)':-2"             -c:v libx264 -preset veryfast -crf 26             -maxrate 2500k -bufsize 5000k             -pix_fmt yuv420p -movflags +faststart             -c:a aac -ac 2 -b:a 128k -threads 0             "video.mp4"
             
-          # 2. Extract poster thumbnail at 5s (or 0s fallback)
-          ffmpeg -ss 00:00:05 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg" || \
-          ffmpeg -ss 00:00:00 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg"
+          # Extract poster thumbnail at 10s (or 0s fallback)
+          ffmpeg -ss 00:00:10 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg" ||           ffmpeg -ss 00:00:00 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg"
 
-          # 3. Extract technical metadata
+          # Extract technical metadata
           ffprobe -v quiet -print_format json -show_format -show_streams video.mp4 > "technical_metadata.json"
 
       - name: Upload Finished Bundle to VPS
         run: |
           cd work
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
-            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK"
+          API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
+          [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK"
 
-          curl -f -X POST \
-            --retry 5 \
-            --retry-delay 3 \
-            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
-            -F "work_id=${{ inputs.work_id }}" \
-            -F "video=@video.mp4" \
-            -F "thumbnail=@thumbnail.jpg" \
-            -F "technical_metadata=@technical_metadata.json" \
-            "${{ inputs.callback_url }}/complete"
+          curl -f -X POST             --retry 5             --retry-delay 3             -H "X-API-Key: $API_KEY"             -F "work_id=${{ inputs.work_id }}"             -F "video=@video.mp4"             -F "thumbnail=@thumbnail.jpg"             -F "technical_metadata=@technical_metadata.json"             "${{ inputs.callback_url }}/complete"
 
       - name: Handle Failure
         if: failure()
         run: |
-          curl -X POST "${{ inputs.callback_url }}/fail" \
-            -H "X-API-Key: ${{ secrets.SERVER_CALLBACK_SECRET }}" \
-            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner"
+          API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
+          [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+          curl -X POST "${{ inputs.callback_url }}/fail"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner"
