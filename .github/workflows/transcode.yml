@@ -25,10 +25,12 @@ jobs:
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
           curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
 
-      - name: Install System Tools
+      - name: Install FFmpeg & Tools
         run: |
           mkdir -p work
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2 jq
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
 
       - name: Download Raw Video
         run: |
