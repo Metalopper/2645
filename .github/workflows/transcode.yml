@@ -46,6 +46,16 @@ jobs:
           aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" || \
           curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
 
+      - name: Extract Metadata & Poster
+        run: |
+          cd work
+          # Extract poster thumbnail at 10s (or 0s fallback)
+          ffmpeg -ss 00:00:10 -i source_video -vframes 1 -q:v 2 "thumbnail.jpg" || \
+          ffmpeg -ss 00:00:00 -i source_video -vframes 1 -q:v 2 "thumbnail.jpg"
+
+          # Extract technical metadata
+          ffprobe -v quiet -print_format json -show_format -show_streams source_video > "technical_metadata.json"
+
       - name: Transcode Multi-Quality HLS Ladder (1080p, 720p, 480p)
         run: |
           cd work
@@ -58,13 +68,14 @@ jobs:
           mkdir -p hls/1080p hls/720p hls/480p
 
           # Multi-bitrate HLS encoding: 1080p, 720p, 480p with keyframes locked every 48 frames (2s)
+          # Use trunc(oh*a/2)*2 to guarantee even dimensions (divisible by 2) for H.264
           ffmpeg -y -v warning -stats \
             -i source_video \
             -filter_complex \
             "[0:v]split=3[v1][v2][v3]; \
-             [v1]scale=w=-2:h='min(1080,ih)':force_original_aspect_ratio=decrease[v1out]; \
-             [v2]scale=w=-2:h='min(720,ih)':force_original_aspect_ratio=decrease[v2out]; \
-             [v3]scale=w=-2:h='min(480,ih)':force_original_aspect_ratio=decrease[v3out]" \
+             [v1]scale='trunc(oh*a/2)*2:min(1080,ih)'[v1out]; \
+             [v2]scale='trunc(oh*a/2)*2:min(720,ih)'[v2out]; \
+             [v3]scale='trunc(oh*a/2)*2:min(480,ih)'[v3out]" \
             -map "[v1out]" -c:v:0 libx264 -preset veryfast -crf 23 -maxrate:v:0 2800k -bufsize:v:0 5600k -pix_fmt yuv420p -g 48 -keyint_min 48 -sc_threshold 0 \
             -map "[v2out]" -c:v:1 libx264 -preset veryfast -crf 25 -maxrate:v:1 1400k -bufsize:v:1 2800k -pix_fmt yuv420p -g 48 -keyint_min 48 -sc_threshold 0 \
             -map "[v3out]" -c:v:2 libx264 -preset veryfast -crf 27 -maxrate:v:2 800k -bufsize:v:2 1600k -pix_fmt yuv420p -g 48 -keyint_min 48 -sc_threshold 0 \
@@ -81,22 +92,15 @@ jobs:
             -var_stream_map "v:0,a:0,name:1080p v:1,a:1,name:720p v:2,a:2,name:480p" \
             hls/%v/index.m3u8
 
-          # Fallback progressive video.mp4 (720p)
+          # Fallback progressive video.mp4 (fast 720p)
           ffmpeg -y -v warning \
             -i source_video \
-            -vf "scale='min(1280,iw)':-2" \
-            -c:v libx264 -preset veryfast -crf 25 \
-            -maxrate 1500k -bufsize 3000k \
+            -vf "scale='trunc(oh*a/2)*2:min(720,ih)'" \
+            -c:v libx264 -preset faster -crf 26 \
+            -maxrate 1400k -bufsize 2800k \
             -pix_fmt yuv420p -movflags +faststart \
             -c:a aac -ac 2 -b:a 128k \
             "hls/video.mp4"
-
-          # Extract poster thumbnail at 10s (or 0s fallback)
-          ffmpeg -ss 00:00:10 -i hls/video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg" || \
-          ffmpeg -ss 00:00:00 -i hls/video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg"
-
-          # Extract technical metadata
-          ffprobe -v quiet -print_format json -show_format -show_streams hls/video.mp4 > "technical_metadata.json"
 
           # Package HLS outputs into zip bundle for single-archive callback transfer
           cd hls
