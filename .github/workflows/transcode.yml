@@ -25,14 +25,10 @@ jobs:
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
           curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
 
-      - name: Bootstrap Static FFmpeg & Tools
+      - name: Install System Tools
         run: |
-          mkdir -p bin work
-          echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH
-          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 jq
-          curl -sL https://github.com/eugeneware/ffmpeg-static/releases/latest/download/linux-x64 -o bin/ffmpeg
-          curl -sL https://github.com/eugeneware/ffprobe-static/releases/latest/download/linux-x64 -o bin/ffprobe
-          chmod +x bin/ffmpeg bin/ffprobe
+          mkdir -p work
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2 jq
 
       - name: Download Raw Video
         run: |
