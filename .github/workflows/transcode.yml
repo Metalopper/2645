@@ -16,19 +16,21 @@ on:
 jobs:
   transcode:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Report Runner Spun Up
         run: |
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&progress=10&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
 
       - name: Install FFmpeg & Tools
         run: |
           mkdir -p work
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2 jq
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2 jq zip
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
 
@@ -37,38 +39,94 @@ jobs:
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING&progress=25"
             
-          aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" ||           curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
+          aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" || \
+          curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
 
-      - name: Transcode Media (Lossy Space-Saving H.264 + Stereo AAC + Faststart)
+      - name: Transcode Multi-Quality HLS Ladder (1080p, 720p, 480p)
         run: |
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=45"
 
-          # Transcode video with lossy space-saving profile, stereo downmixing, and faststart
-          ffmpeg -y -v warning -stats             -i source_video             -vf "scale='min(1920,iw)':-2"             -c:v libx264 -preset veryfast -crf 26             -maxrate 2500k -bufsize 5000k             -pix_fmt yuv420p -movflags +faststart             -c:a aac -ac 2 -b:a 128k -threads 0             "video.mp4"
-            
+          mkdir -p hls/1080p hls/720p hls/480p
+
+          # Multi-bitrate HLS encoding: 1080p, 720p, 480p with keyframes locked every 48 frames (2s)
+          ffmpeg -y -v warning -stats \
+            -i source_video \
+            -filter_complex \
+            "[0:v]split=3[v1][v2][v3]; \
+             [v1]scale=w=-2:h='min(1080,ih)':force_original_aspect_ratio=decrease[v1out]; \
+             [v2]scale=w=-2:h='min(720,ih)':force_original_aspect_ratio=decrease[v2out]; \
+             [v3]scale=w=-2:h='min(480,ih)':force_original_aspect_ratio=decrease[v3out]" \
+            -map "[v1out]" -c:v:0 libx264 -preset veryfast -crf 23 -maxrate:v:0 2800k -bufsize:v:0 5600k -pix_fmt yuv420p -g 48 -keyint_min 48 -sc_threshold 0 \
+            -map "[v2out]" -c:v:1 libx264 -preset veryfast -crf 25 -maxrate:v:1 1400k -bufsize:v:1 2800k -pix_fmt yuv420p -g 48 -keyint_min 48 -sc_threshold 0 \
+            -map "[v3out]" -c:v:2 libx264 -preset veryfast -crf 27 -maxrate:v:2 800k -bufsize:v:2 1600k -pix_fmt yuv420p -g 48 -keyint_min 48 -sc_threshold 0 \
+            -map 0:a:0? -c:a:0 aac -b:a:0 128k -ac 2 \
+            -map 0:a:0? -c:a:1 aac -b:a:1 128k -ac 2 \
+            -map 0:a:0? -c:a:2 aac -b:a:2 96k -ac 2 \
+            -f hls \
+            -hls_time 6 \
+            -hls_playlist_type vod \
+            -hls_flags independent_segments \
+            -hls_segment_type mpegts \
+            -hls_segment_filename "hls/%v/data%03d.ts" \
+            -master_pl_name master.m3u8 \
+            -var_stream_map "v:0,a:0,name:1080p v:1,a:1,name:720p v:2,a:2,name:480p" \
+            hls/%v/index.m3u8
+
+          # Fallback progressive video.mp4 (720p)
+          ffmpeg -y -v warning \
+            -i source_video \
+            -vf "scale='min(1280,iw)':-2" \
+            -c:v libx264 -preset veryfast -crf 25 \
+            -maxrate 1500k -bufsize 3000k \
+            -pix_fmt yuv420p -movflags +faststart \
+            -c:a aac -ac 2 -b:a 128k \
+            "hls/video.mp4"
+
           # Extract poster thumbnail at 10s (or 0s fallback)
-          ffmpeg -ss 00:00:10 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg" ||           ffmpeg -ss 00:00:00 -i video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg"
+          ffmpeg -ss 00:00:10 -i hls/video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg" || \
+          ffmpeg -ss 00:00:00 -i hls/video.mp4 -vframes 1 -q:v 2 "thumbnail.jpg"
 
           # Extract technical metadata
-          ffprobe -v quiet -print_format json -show_format -show_streams video.mp4 > "technical_metadata.json"
+          ffprobe -v quiet -print_format json -show_format -show_streams hls/video.mp4 > "technical_metadata.json"
+
+          # Package HLS outputs into zip bundle for single-archive callback transfer
+          cd hls
+          zip -r -0 ../hls_bundle.zip master.m3u8 1080p 720p 480p video.mp4
+          cd ..
 
       - name: Upload Finished Bundle to VPS
         run: |
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK"
+          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=90"
 
-          curl -f -X POST             --retry 5             --retry-delay 3             -H "X-API-Key: $API_KEY"             -F "work_id=${{ inputs.work_id }}"             -F "video=@video.mp4"             -F "thumbnail=@thumbnail.jpg"             -F "technical_metadata=@technical_metadata.json"             "${{ inputs.callback_url }}/complete"
+          curl -f -X POST \
+            --retry 5 \
+            --retry-delay 3 \
+            -H "X-API-Key: $API_KEY" \
+            -F "work_id=${{ inputs.work_id }}" \
+            -F "video=@hls_bundle.zip" \
+            -F "thumbnail=@thumbnail.jpg" \
+            -F "technical_metadata=@technical_metadata.json" \
+            "${{ inputs.callback_url }}/complete"
 
       - name: Handle Failure
         if: failure()
         run: |
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -X POST "${{ inputs.callback_url }}/fail"             -H "X-API-Key: $API_KEY"             -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner"
+          curl -X POST "${{ inputs.callback_url }}/fail" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner"
