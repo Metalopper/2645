@@ -191,8 +191,8 @@ jobs:
                   continue
               ts_files = sorted(glob.glob(os.path.join(res_dir, "*.ts")))
               for ts in ts_files:
-                  jpg = os.path.splitext(ts)[0] + ".jpg"
-                  with open(ts, "rb") as fin, open(jpg, "wb") as fout:
+                  jpeg = os.path.splitext(ts)[0] + ".jpeg"
+                  with open(ts, "rb") as fin, open(jpeg, "wb") as fout:
                       fout.write(dummy_jpeg)
                       while chunk := fin.read(1024 * 1024):
                           fout.write(chunk)
@@ -202,11 +202,11 @@ jobs:
               if os.path.exists(m3u8_file):
                   with open(m3u8_file, "r") as f:
                       content = f.read()
-                  content = content.replace(".ts", ".jpg")
+                  content = content.replace(".ts", ".jpeg")
                   with open(m3u8_file, "w") as f:
                       f.write(content)
 
-          print("Successfully converted all video segments to masked JPEGs with JFIF headers")
+          print("Successfully converted all video segments to masked JPEGs (.jpeg) with JFIF headers")
           '
 
           # Package HLS outputs into zip bundle (master playlist, quality ladders, storyboards)
