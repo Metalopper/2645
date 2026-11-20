@@ -29,8 +29,8 @@ jobs:
 
       - name: Install FFmpeg & Tools
         run: |
-          mkdir -p work
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2 jq zip
+          mkdir -p work/hls
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg aria2 jq zip python3
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
 
@@ -46,7 +46,7 @@ jobs:
           aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" || \
           curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
 
-      - name: Extract Metadata & Poster
+      - name: Extract Metadata, Poster & Storyboard Spritesheet
         run: |
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
@@ -69,6 +69,42 @@ jobs:
           echo "TOTAL_DURATION=$DUR" >> $GITHUB_ENV
           echo "Total video duration detected: $DUR seconds"
 
+          # Generate 160x90 tiled 10x10 storyboard sprite sheets every 10 seconds
+          echo "Generating storyboard preview spritesheets..."
+          ffmpeg -y -i source_video -vf "fps=1/10,scale=160:90,tile=10x10" -q:v 3 "hls/storyboard_%03d.jpg" || true
+
+          # Generate storyboard.vtt mapping each 10s timestamp to coordinates on sprite sheets
+          python3 -c "
+          import os
+
+          def format_vtt_time(seconds):
+              h = int(seconds // 3600)
+              m = int((seconds % 3600) // 60)
+              s = seconds % 60
+              return f'{h:02d}:{m:02d}:{s:06.3f}'
+
+          dur = float('${DUR}')
+          interval = 10
+          cols, rows = 10, 10
+          tiles_per_sheet = cols * rows
+          w, h = 160, 90
+
+          total_frames = int(dur // interval) + 1
+          with open('hls/storyboard.vtt', 'w', encoding='utf-8') as f:
+              f.write('WEBVTT\n\n')
+              for i in range(total_frames):
+                  sheet = (i // tiles_per_sheet) + 1
+                  k = i % tiles_per_sheet
+                  c = k % cols
+                  r = k // cols
+                  x = c * w
+                  y = r * h
+                  t_start = format_vtt_time(i * interval)
+                  t_end = format_vtt_time(min(dur, (i + 1) * interval))
+                  f.write(f'{t_start} --> {t_end}\nstoryboard_{sheet:03d}.jpg#xywh={x},{y},{w},{h}\n\n')
+          print('Successfully generated storyboard.vtt with', total_frames, 'timestamps')
+          "
+
       - name: Transcode Multi-Quality HLS Ladder (1080p, 720p, 480p)
         run: |
           cd work
@@ -81,7 +117,7 @@ jobs:
             -H "X-API-Key: $API_KEY" \
             -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=30"
 
-          # Real frame-accurate progress monitor from ffmpeg out_time_us (30% -> 92%)
+          # Real frame-accurate progress monitor from ffmpeg out_time_us (30% -> 90%)
           rm -f /tmp/ff_progress_hls.txt
           (
             last_pct=30
@@ -93,8 +129,8 @@ jobs:
                   sec_enc=$((out_us / 1000000))
                   calc_pct=$(awk -v enc="$sec_enc" -v dur="$TOTAL_DUR" 'BEGIN {
                     if (dur > 0) {
-                      p = 30 + (enc / dur) * 62;
-                      if (p > 92) p = 92;
+                      p = 30 + (enc / dur) * 60;
+                      if (p > 90) p = 90;
                       printf "%d", p;
                     } else {
                       printf "30";
@@ -141,9 +177,41 @@ jobs:
 
           kill $HLS_MONITOR_PID 2>/dev/null || true
 
-          # Package pure HLS outputs into zip bundle (no redundant mp4)
+          # Obfuscate all segments to JPEG with dummy JFIF header to prevent hotlinking and save on DRM
+          echo "Obfuscating stream segments into masked JPEG files..."
+          python3 -c '
+          import os, glob
+
+          header = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xfe\x00\x14UnivisaSecureStream\x00"
+          dummy_jpeg = header + b"\x00" * (128 - len(header))
+
+          for res in ["1080p", "720p", "480p"]:
+              res_dir = os.path.join("hls", res)
+              if not os.path.exists(res_dir):
+                  continue
+              ts_files = sorted(glob.glob(os.path.join(res_dir, "*.ts")))
+              for ts in ts_files:
+                  jpg = os.path.splitext(ts)[0] + ".jpg"
+                  with open(ts, "rb") as fin, open(jpg, "wb") as fout:
+                      fout.write(dummy_jpeg)
+                      while chunk := fin.read(1024 * 1024):
+                          fout.write(chunk)
+                  os.remove(ts)
+
+              m3u8_file = os.path.join(res_dir, "index.m3u8")
+              if os.path.exists(m3u8_file):
+                  with open(m3u8_file, "r") as f:
+                      content = f.read()
+                  content = content.replace(".ts", ".jpg")
+                  with open(m3u8_file, "w") as f:
+                      f.write(content)
+
+          print("Successfully converted all video segments to masked JPEGs with JFIF headers")
+          '
+
+          # Package HLS outputs into zip bundle (master playlist, quality ladders, storyboards)
           cd hls
-          zip -r -0 ../hls_bundle.zip master.m3u8 1080p 720p 480p
+          zip -r -0 ../hls_bundle.zip master.m3u8 1080p 720p 480p storyboard*.jpg storyboard.vtt
           cd ..
 
       - name: Upload Finished Bundle to VPS
