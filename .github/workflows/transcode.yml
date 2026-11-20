@@ -23,9 +23,6 @@ jobs:
         run: |
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&progress=10&run_id=${{ github.run_id }}&runner=${{ runner.name }}" || \
           curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
             -H "X-API-Key: $API_KEY" \
             -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&progress=10&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
@@ -42,9 +39,9 @@ jobs:
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+          curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING&progress=25" || true
+            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING&progress=20"
             
           aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" || \
           curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
@@ -52,6 +49,13 @@ jobs:
       - name: Extract Metadata & Poster
         run: |
           cd work
+          API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
+          [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+
+          curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=EXTRACTING_METADATA&progress=28"
+
           # Extract poster thumbnail at 10s (or 0s fallback)
           ffmpeg -ss 00:00:10 -i source_video -vframes 1 -q:v 2 "thumbnail.jpg" || \
           ffmpeg -ss 00:00:00 -i source_video -vframes 1 -q:v 2 "thumbnail.jpg"
@@ -59,42 +63,60 @@ jobs:
           # Extract technical metadata
           ffprobe -v quiet -print_format json -show_format -show_streams source_video > "technical_metadata.json"
 
+          # Extract precise duration in seconds
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 source_video | cut -d. -f1)
+          [ -z "$DUR" ] || [ "$DUR" -le 0 ] 2>/dev/null && DUR=1
+          echo "TOTAL_DURATION=$DUR" >> $GITHUB_ENV
+          echo "Total video duration detected: $DUR seconds"
+
       - name: Transcode Multi-Quality HLS Ladder (1080p, 720p, 480p)
         run: |
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+          TOTAL_DUR=${TOTAL_DURATION:-1}
 
-          # Initial transcode stage notification
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=45" || \
+          # Initial transcode notification
           curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=45" || true
+            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=30"
 
-          # Background pulse monitor: increments progress every 75s (45% -> 85%) so Admin Panel stays live
+          # Real frame-accurate progress monitor from ffmpeg out_time_us
+          rm -f /tmp/ff_progress_hls.txt
           (
-            pct=45
+            last_pct=30
             while true; do
-              sleep 75
-              if [ $pct -lt 85 ]; then
-                pct=$((pct + 2))
+              sleep 10
+              if [ -f /tmp/ff_progress_hls.txt ]; then
+                out_us=$(grep "out_time_us=" /tmp/ff_progress_hls.txt | tail -n 1 | cut -d= -f2)
+                if [ -n "$out_us" ] && [ "$out_us" -gt 0 ] 2>/dev/null; then
+                  sec_enc=$((out_us / 1000000))
+                  calc_pct=$(awk -v enc="$sec_enc" -v dur="$TOTAL_DUR" 'BEGIN {
+                    if (dur > 0) {
+                      p = 30 + (enc / dur) * 55;
+                      if (p > 85) p = 85;
+                      printf "%d", p;
+                    } else {
+                      printf "30";
+                    }
+                  }')
+                  if [ "$calc_pct" -gt "$last_pct" ]; then
+                    last_pct=$calc_pct
+                    curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+                      -H "X-API-Key: $API_KEY" \
+                      -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=$calc_pct" || true
+                  fi
+                fi
               fi
-              curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-                -H "X-API-Key: $API_KEY" \
-                -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=$pct" || \
-              curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
-                -H "X-API-Key: $API_KEY" \
-                -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=$pct" || true
             done
           ) &
-          PULSE_PID=$!
+          HLS_MONITOR_PID=$!
 
           mkdir -p hls/1080p hls/720p hls/480p
 
           # Multi-bitrate HLS encoding: 1080p, 720p, 480p with keyframes locked every 48 frames (2s)
           ffmpeg -y -v warning -stats \
+            -progress /tmp/ff_progress_hls.txt \
             -i source_video \
             -filter_complex \
             "[0:v]split=3[v1][v2][v3]; \
@@ -117,8 +139,42 @@ jobs:
             -var_stream_map "v:0,a:0,name:1080p v:1,a:1,name:720p v:2,a:2,name:480p" \
             hls/%v/index.m3u8
 
+          kill $HLS_MONITOR_PID 2>/dev/null || true
+
+          # Real frame-accurate progress for progressive MP4 encode (85% -> 92%)
+          rm -f /tmp/ff_progress_mp4.txt
+          (
+            last_pct=85
+            while true; do
+              sleep 10
+              if [ -f /tmp/ff_progress_mp4.txt ]; then
+                out_us=$(grep "out_time_us=" /tmp/ff_progress_mp4.txt | tail -n 1 | cut -d= -f2)
+                if [ -n "$out_us" ] && [ "$out_us" -gt 0 ] 2>/dev/null; then
+                  sec_enc=$((out_us / 1000000))
+                  calc_pct=$(awk -v enc="$sec_enc" -v dur="$TOTAL_DUR" 'BEGIN {
+                    if (dur > 0) {
+                      p = 85 + (enc / dur) * 7;
+                      if (p > 92) p = 92;
+                      printf "%d", p;
+                    } else {
+                      printf "85";
+                    }
+                  }')
+                  if [ "$calc_pct" -gt "$last_pct" ]; then
+                    last_pct=$calc_pct
+                    curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+                      -H "X-API-Key: $API_KEY" \
+                      -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=$calc_pct" || true
+                  fi
+                fi
+              fi
+            done
+          ) &
+          MP4_MONITOR_PID=$!
+
           # Fallback progressive video.mp4 (fast 720p)
           ffmpeg -y -v warning \
+            -progress /tmp/ff_progress_mp4.txt \
             -i source_video \
             -vf "scale='trunc(oh*a/2)*2:min(720,ih)'" \
             -c:v libx264 -preset faster -crf 26 \
@@ -127,8 +183,7 @@ jobs:
             -c:a aac -ac 2 -b:a 128k \
             "hls/video.mp4"
 
-          # Stop the progress pulse monitor
-          kill $PULSE_PID 2>/dev/null || true
+          kill $MP4_MONITOR_PID 2>/dev/null || true
 
           # Package HLS outputs into zip bundle for single-archive callback transfer
           cd hls
@@ -141,28 +196,11 @@ jobs:
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
 
-          curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
-            -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=90" || \
           curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=90" || true
+            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=93"
 
-          # Upload finished bundle directly to VPS port 8095 (bypassing Cloudflare 100 MB body size limit)
-          UPLOAD_ENDPOINT="${{ inputs.callback_url }}/complete"
-          if echo "$UPLOAD_ENDPOINT" | grep -qi "univisanow.com"; then
-            UPLOAD_ENDPOINT="http://13.140.232.187:8095/api/uniraw/complete"
-          fi
-
-          curl -f -X POST \
-            --retry 5 \
-            --retry-delay 3 \
-            -H "X-API-Key: $API_KEY" \
-            -F "work_id=${{ inputs.work_id }}" \
-            -F "video=@hls_bundle.zip" \
-            -F "thumbnail=@thumbnail.jpg" \
-            -F "technical_metadata=@technical_metadata.json" \
-            "$UPLOAD_ENDPOINT" || \
+          # Upload finished bundle directly to VPS port 8095 (bypassing Cloudflare completely)
           curl -f -X POST \
             --retry 5 \
             --retry-delay 3 \
@@ -178,9 +216,6 @@ jobs:
         run: |
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
-          curl -X POST "${{ inputs.callback_url }}/fail" \
-            -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner" || \
           curl -X POST "http://13.140.232.187:8095/api/uniraw/fail" \
             -H "X-API-Key: $API_KEY" \
             -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner" || true
