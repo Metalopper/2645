@@ -25,6 +25,9 @@ jobs:
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
           curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
             -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&progress=10&run_id=${{ github.run_id }}&runner=${{ runner.name }}" || \
+          curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
             -d "work_id=${{ inputs.work_id }}&stage=RUNNER_SPUN_UP&progress=10&run_id=${{ github.run_id }}&runner=${{ runner.name }}"
 
       - name: Install FFmpeg & Tools
@@ -41,7 +44,7 @@ jobs:
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
           curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING&progress=25"
+            -d "work_id=${{ inputs.work_id }}&stage=DOWNLOADING&progress=25" || true
             
           aria2c -x 6 -s 6 --retry-wait=2 --max-tries=4 -o "source_video" "${{ inputs.source_url }}" || \
           curl -fSL -C - --retry 4 --retry-delay 2 -o "source_video" "${{ inputs.source_url }}"
@@ -61,14 +64,36 @@ jobs:
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+
+          # Initial transcode stage notification
           curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=45"
+            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=45" || \
+          curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=45" || true
+
+          # Background pulse monitor: increments progress every 75s (45% -> 85%) so Admin Panel stays live
+          (
+            pct=45
+            while true; do
+              sleep 75
+              if [ $pct -lt 85 ]; then
+                pct=$((pct + 2))
+              fi
+              curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
+                -H "X-API-Key: $API_KEY" \
+                -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=$pct" || \
+              curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+                -H "X-API-Key: $API_KEY" \
+                -d "work_id=${{ inputs.work_id }}&stage=TRANSCODING&progress=$pct" || true
+            done
+          ) &
+          PULSE_PID=$!
 
           mkdir -p hls/1080p hls/720p hls/480p
 
           # Multi-bitrate HLS encoding: 1080p, 720p, 480p with keyframes locked every 48 frames (2s)
-          # Use trunc(oh*a/2)*2 to guarantee even dimensions (divisible by 2) for H.264
           ffmpeg -y -v warning -stats \
             -i source_video \
             -filter_complex \
@@ -102,6 +127,9 @@ jobs:
             -c:a aac -ac 2 -b:a 128k \
             "hls/video.mp4"
 
+          # Stop the progress pulse monitor
+          kill $PULSE_PID 2>/dev/null || true
+
           # Package HLS outputs into zip bundle for single-archive callback transfer
           cd hls
           zip -r -0 ../hls_bundle.zip master.m3u8 1080p 720p 480p video.mp4
@@ -112,9 +140,19 @@ jobs:
           cd work
           API_KEY="${{ secrets.SERVER_CALLBACK_SECRET }}"
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
+
           curl -s -X POST "${{ inputs.callback_url }}/heartbeat" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=90"
+            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=90" || \
+          curl -s -X POST "http://13.140.232.187:8095/api/uniraw/heartbeat" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&stage=UPLOADING_BACK&progress=90" || true
+
+          # Upload finished bundle directly to VPS port 8095 (bypassing Cloudflare 100 MB body size limit)
+          UPLOAD_ENDPOINT="${{ inputs.callback_url }}/complete"
+          if echo "$UPLOAD_ENDPOINT" | grep -qi "univisanow.com"; then
+            UPLOAD_ENDPOINT="http://13.140.232.187:8095/api/uniraw/complete"
+          fi
 
           curl -f -X POST \
             --retry 5 \
@@ -124,7 +162,16 @@ jobs:
             -F "video=@hls_bundle.zip" \
             -F "thumbnail=@thumbnail.jpg" \
             -F "technical_metadata=@technical_metadata.json" \
-            "${{ inputs.callback_url }}/complete"
+            "$UPLOAD_ENDPOINT" || \
+          curl -f -X POST \
+            --retry 5 \
+            --retry-delay 3 \
+            -H "X-API-Key: $API_KEY" \
+            -F "work_id=${{ inputs.work_id }}" \
+            -F "video=@hls_bundle.zip" \
+            -F "thumbnail=@thumbnail.jpg" \
+            -F "technical_metadata=@technical_metadata.json" \
+            "http://13.140.232.187:8095/api/uniraw/complete"
 
       - name: Handle Failure
         if: failure()
@@ -133,4 +180,7 @@ jobs:
           [ -z "$API_KEY" ] && API_KEY="uniraw-callback-secret-8f92a34b9d0e21"
           curl -X POST "${{ inputs.callback_url }}/fail" \
             -H "X-API-Key: $API_KEY" \
-            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner"
+            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner" || \
+          curl -X POST "http://13.140.232.187:8095/api/uniraw/fail" \
+            -H "X-API-Key: $API_KEY" \
+            -d "work_id=${{ inputs.work_id }}&run_id=${{ github.run_id }}&error=Transcoding failed on runner" || true
